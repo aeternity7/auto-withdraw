@@ -54,6 +54,71 @@ func Connect(endpoint string, reciver common.Address, accounts Accounts) (*Chain
 	return &Chain{eth: eth, geth: geth, signer: signer, accounts: accounts, reciever: &reciver}, nil
 }
 
+func (c *Chain) ScanIncoming() error {
+	blockChan := make(chan *types.Header)
+	sub, err := c.eth.SubscribeNewHead(context.Background(), blockChan)
+	if err != nil {
+		return err
+	}
+
+	for {
+		select {
+		case err := <-sub.Err():
+			return err
+		case header := <-blockChan:
+			block, err := c.eth.BlockByHash(context.Background(), header.Hash())
+			if err != nil {
+				log.Printf("couldn't get block by hash %s: %v", header.Hash(), err)
+				continue
+			}
+
+			for _, transaction := range block.Transactions() {
+				if transaction.To() == nil {
+					continue
+				}
+
+				if privateKey, ok := c.accounts[*transaction.To()]; ok {
+					gasPrice, err := c.eth.SuggestGasPrice(context.Background())
+					if err != nil {
+						log.Printf("couldn't get gas price: %v", err)
+						continue
+					}
+
+					nonce, err := c.eth.NonceAt(context.Background(), *transaction.To(), nil)
+					if err != nil {
+						log.Printf("couldn't get nonce for %s: %v", transaction.Hash(), err)
+						continue
+					}
+
+					resendTx := &types.LegacyTx{
+						To:       c.reciever,
+						Value:    new(big.Int).Sub(transaction.Value(), new(big.Int).Mul(gasPrice, new(big.Int).SetUint64(21000))),
+						GasPrice: gasPrice,
+						Gas:      21000,
+						Nonce:    nonce,
+					}
+
+					signedTx, err := types.SignNewTx(privateKey, c.signer, resendTx)
+					if err != nil {
+						log.Printf("couldn't sign replacement tx for %s: %v", transaction.Hash(), err)
+						continue
+					}
+
+					err = c.eth.SendTransaction(context.Background(), signedTx)
+					if err != nil {
+						log.Printf("couldn't send replacement tx for %s: %v", transaction.Hash(), err)
+						continue
+					}
+
+					log.Printf("resend %s with %s", transaction.Hash(), signedTx.Hash())
+
+				}
+
+			}
+		}
+	}
+}
+
 func (c *Chain) ScanPending() error {
 	txChan := make(chan common.Hash)
 	sub, err := c.geth.SubscribePendingTransactions(context.Background(), txChan)
@@ -171,12 +236,21 @@ func main() {
 			log.Printf("couldn't connect to %s: %v", endpoint, err)
 			continue
 		}
-		wg.Add(1)
+		wg.Add(2)
 		go func(endpoint string) {
-			defer wg.Done()
-			log.Printf("starting pending scanner for %s", endpoint)
-			err := chain.ScanPending()
-			log.Println("pending scanner failed:", endpoint, err)
+			go func() {
+				defer wg.Done()
+				log.Printf("starting incoming scanner for %s", endpoint)
+				err := chain.ScanIncoming()
+				log.Println("incoming scanner failed:", endpoint, err)
+			}()
+
+			go func() {
+				defer wg.Done()
+				log.Printf("starting pending scanner for %s", endpoint)
+				err := chain.ScanPending()
+				log.Println("pending scanner failed:", endpoint, err)
+			}()
 		}(endpoint)
 	}
 	wg.Wait()
